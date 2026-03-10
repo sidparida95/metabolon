@@ -101,10 +101,22 @@ python alphagenome_to_mrna.py --out-dir outputs
 python alphagenome_to_mrna.py --api-key YOUR_KEY --no-simulate --out-dir outputs
 ```
 
-**Module 2 only** — train surrogate and run demo predictions:
+**Module 2 only** — train surrogate on synthetic data and run demo predictions:
 
 ```bash
 python surrogate_wholecell.py --n-train 5000 --out-dir outputs
+```
+
+Train on real simulation sweep data:
+
+```bash
+python surrogate_wholecell.py --data-path sweep_outputs.csv --out-dir outputs
+```
+
+Write a CSV format template for sweep data:
+
+```bash
+python -c "from surrogate_wholecell import SweepDataLoader; SweepDataLoader.write_example_csv('sweep_template.csv')"
 ```
 
 ---
@@ -153,7 +165,7 @@ A trained surrogate that maps AlphaGenome variant-effect features (Δlog₂ expr
 ### Architecture
 
 - **5-member MLP ensemble** (3 hidden layers: 256 → 128 → 64, ReLU, Adam)
-- **Multi-output regression**: one model per phenotype, wrapped in `MultiOutputRegressor`
+- **Multi-output regression**: `MultiOutputRegressor` clones the base MLP and fits one instance per phenotype output (5 independent MLPs per ensemble member = 25 MLPs total)
 - **Input normalisation**: `StandardScaler` per ensemble member
 - **Uncertainty quantification**: ensemble standard deviation per phenotype
 - **Feature dimension**: 40 (25 gene Δlog₂ values + 13 functional class one-hot + TSS distance + variant type)
@@ -205,13 +217,17 @@ In production, replace `Syn3ASimulationEmulator` with real outputs from the Luth
 ### Save and reload
 
 ```python
-from surrogate_wholecell import Syn3ASurrogateModel
+from surrogate_wholecell import Syn3ASurrogateModel, Syn3ASimulationEmulator
 
-# Save after training
-model.save("outputs/syn3a_surrogate.pkl")
+# Train
+emulator = Syn3ASimulationEmulator(rng_seed=42)
+X, Y = emulator.generate(n_samples=5000)
+surr = Syn3ASurrogateModel()
+surr.train(X, Y)
+surr.save("outputs/syn3a_surrogate.pkl")
 
-# Reload in a new session
-model = Syn3ASurrogateModel.load("outputs/syn3a_surrogate.pkl")
+# Reload in a new session — no retraining needed
+surr = Syn3ASurrogateModel.load("outputs/syn3a_surrogate.pkl")
 ```
 
 ---
@@ -221,10 +237,67 @@ model = Syn3ASurrogateModel.load("outputs/syn3a_surrogate.pkl")
 Both modules run without any external dependencies or API keys in simulation mode. This is the default when no `--api-key` is provided. Simulation mode:
 
 - Generates biologically plausible synthetic RNA-seq tracks (not real AlphaGenome predictions)
-- Uses physics-based training data (not real whole-cell simulation outputs)
+- Uses physics-based training data from `Syn3ASimulationEmulator` (not real whole-cell simulation outputs)
 - Is intended for development, testing, and demonstration only
 
-To use real data, supply an AlphaGenome API key and replace `Syn3ASimulationEmulator` with actual Syn3A simulation sweep outputs.
+---
+
+## Using real data
+
+### Module 1 — real AlphaGenome predictions
+
+Pass your API key to disable simulation mode:
+
+```bash
+python alphagenome_to_mrna.py --api-key YOUR_KEY --no-simulate --out-dir outputs
+```
+
+Or in Python:
+
+```python
+from alphagenome_to_mrna import AlphaGenomeToMRNAPipeline
+pipeline = AlphaGenomeToMRNAPipeline(api_key="YOUR_KEY", simulate=False)
+table = pipeline.run()
+```
+
+### Module 2 — real Syn3A simulation sweep data
+
+The surrogate can be trained on real outputs from the Luthey-Schulten lab CME/ODE simulation by passing a sweep CSV via `--sweep-data`. This completely replaces `Syn3ASimulationEmulator`.
+
+**Step 1** — generate an example CSV to use as a format template:
+
+```bash
+python -c "from surrogate_wholecell import SweepDataLoader; SweepDataLoader.write_example_csv('sweep_template.csv')"
+```
+
+**Step 2** — populate the CSV with real simulation outputs. Required columns:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `variant_id` | str | Unique ID for this simulation run |
+| `affected_function` | str | Functional class (see `FUNCTIONAL_CLASSES`) |
+| `tss_distance_bp` | int | Variant distance to TSS |
+| `variant_type` | str | `SNP`, `indel`, or `structural` |
+| `delta_log2_<gene>` | float | Δlog₂ expression vs. WT for each gene in `GENE_NAMES_ORDERED` |
+| `division_time_min` | float | Simulated division time (minutes) |
+| `growth_rate_per_hr` | float | Simulated growth rate (h⁻¹) |
+| `dna_replication_success` | float | Simulated replication success probability |
+| `atp_flux_rel` | float | Simulated ATP flux relative to WT |
+| `ribosome_occupancy` | float | Simulated ribosome occupancy fraction |
+
+**Step 3** — train the surrogate on the real data:
+
+```bash
+python run_pipeline.py --sweep-data sweep_outputs.csv --out-dir outputs
+```
+
+Or using the surrogate module directly:
+
+```bash
+python surrogate_wholecell.py --data-path sweep_outputs.csv --out-dir outputs
+```
+
+`SweepDataLoader` validates column presence and warns on out-of-range phenotype values before training begins.
 
 ---
 

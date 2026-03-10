@@ -331,19 +331,184 @@ class Syn3ASimulationEmulator:
 
 
 # ---------------------------------------------------------------------------
-# Surrogate model
+# Real simulation sweep data loader
 # ---------------------------------------------------------------------------
+
+class SweepDataLoader:
+    """
+    Loads real Syn3A whole-cell simulation sweep outputs for surrogate training.
+
+    Expected CSV format (one row per simulation run)
+    -------------------------------------------------
+    Required columns:
+      variant_id          : str  — unique identifier for this perturbation
+      affected_function   : str  — functional class (must match FUNCTIONAL_CLASSES)
+      tss_distance_bp     : int  — variant distance to TSS
+      variant_type        : str  — SNP | indel | structural
+
+    Per-gene expression columns (one per gene in GENE_NAMES_ORDERED):
+      delta_log2_<gene>   : float  — Δlog₂(fold-change) vs. wild-type
+
+    Phenotype target columns (must all be present):
+      division_time_min
+      growth_rate_per_hr
+      dna_replication_success
+      atp_flux_rel
+      ribosome_occupancy
+
+    Example header
+    --------------
+    variant_id,affected_function,tss_distance_bp,variant_type,
+    delta_log2_dnaA,...,delta_log2_dnaK,
+    division_time_min,growth_rate_per_hr,dna_replication_success,atp_flux_rel,ribosome_occupancy
+
+    Usage
+    -----
+    loader = SweepDataLoader("path/to/sweep_outputs.csv")
+    X, Y = loader.load()
+    surrogate = Syn3ASurrogateModel()
+    surrogate.train(X, Y)
+    """
+
+    REQUIRED_PHENOTYPE_COLS = [
+        "division_time_min",
+        "growth_rate_per_hr",
+        "dna_replication_success",
+        "atp_flux_rel",
+        "ribosome_occupancy",
+    ]
+
+    def __init__(self, csv_path: str | Path):
+        self.csv_path = Path(csv_path)
+        if not self.csv_path.exists():
+            raise FileNotFoundError(f"Sweep data file not found: {self.csv_path}")
+
+    def load(self) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Parse the sweep CSV and return (X, Y) arrays ready for surrogate training.
+
+        Returns
+        -------
+        X : np.ndarray, shape (n_samples, FEATURE_DIM)
+        Y : np.ndarray, shape (n_samples, len(PHENOTYPE_NAMES))
+
+        Raises
+        ------
+        ValueError : if required columns are missing or data fails validation
+        """
+        df = pd.read_csv(self.csv_path)
+        self._validate(df)
+
+        records = []
+        for _, row in df.iterrows():
+            delta = {
+                g: float(row[f"delta_log2_{g}"])
+                for g in GENE_NAMES_ORDERED
+                if f"delta_log2_{g}" in df.columns
+            }
+            rec = VariantEffectRecord(
+                variant_id=str(row.get("variant_id", "unknown")),
+                chromosome=str(row.get("chromosome", "chrSyn3A")),
+                position=int(row.get("position", 0)),
+                ref=str(row.get("ref", "N")),
+                alt=str(row.get("alt", "N")),
+                delta_log2_expr=delta,
+                affected_function=str(row.get("affected_function", "unknown")),
+                tss_distance_bp=int(row.get("tss_distance_bp", 0)),
+                variant_type=str(row.get("variant_type", "SNP")),
+            )
+            records.append(featurise(rec))
+
+        X = np.array(records, dtype=np.float32)
+        Y = df[self.REQUIRED_PHENOTYPE_COLS].to_numpy(dtype=np.float32)
+
+        log.info(
+            "SweepDataLoader: loaded %d samples from %s  (X=%s, Y=%s)",
+            len(X), self.csv_path, X.shape, Y.shape,
+        )
+        self._log_stats(df)
+        return X, Y
+
+    def _validate(self, df: pd.DataFrame) -> None:
+        missing_pheno = [c for c in self.REQUIRED_PHENOTYPE_COLS if c not in df.columns]
+        if missing_pheno:
+            raise ValueError(
+                f"Sweep CSV is missing required phenotype columns: {missing_pheno}\n"
+                f"Expected columns: {self.REQUIRED_PHENOTYPE_COLS}"
+            )
+        gene_cols = [f"delta_log2_{g}" for g in GENE_NAMES_ORDERED if f"delta_log2_{g}" in df.columns]
+        if len(gene_cols) == 0:
+            raise ValueError(
+                "Sweep CSV contains no delta_log2_<gene> expression columns. "
+                f"Expected at least one of: {['delta_log2_'+g for g in GENE_NAMES_ORDERED[:3]]} ..."
+            )
+        log.info("SweepDataLoader: found %d / %d expected gene columns", len(gene_cols), len(GENE_NAMES_ORDERED))
+
+        # Validate phenotype ranges
+        range_checks = {
+            "division_time_min":       (10, 1200),
+            "growth_rate_per_hr":      (0, 5),
+            "dna_replication_success": (0, 1),
+            "atp_flux_rel":            (0, 10),
+            "ribosome_occupancy":      (0, 1),
+        }
+        for col, (lo, hi) in range_checks.items():
+            if col in df.columns:
+                out = df[(df[col] < lo) | (df[col] > hi)]
+                if len(out) > 0:
+                    log.warning(
+                        "  %d rows have %s outside expected range [%s, %s] — will be used as-is",
+                        len(out), col, lo, hi,
+                    )
+
+    def _log_stats(self, df: pd.DataFrame) -> None:
+        log.info("  Phenotype statistics in sweep data:")
+        for col in self.REQUIRED_PHENOTYPE_COLS:
+            log.info("    %-32s  mean=%.3f  std=%.3f  min=%.3f  max=%.3f",
+                     col, df[col].mean(), df[col].std(), df[col].min(), df[col].max())
+
+    @staticmethod
+    def write_example_csv(path: str | Path, n_rows: int = 5) -> None:
+        """
+        Write a minimal example CSV to illustrate the expected format.
+        Useful as a template when preparing real simulation sweep data.
+        """
+        path = Path(path)
+        gene_cols = [f"delta_log2_{g}" for g in GENE_NAMES_ORDERED]
+        header = (
+            ["variant_id", "chromosome", "position", "ref", "alt",
+             "affected_function", "tss_distance_bp", "variant_type"]
+            + gene_cols
+            + SweepDataLoader.REQUIRED_PHENOTYPE_COLS
+        )
+        rows = []
+        rng = np.random.default_rng(0)
+        for i in range(n_rows):
+            gene_vals = rng.normal(0, 0.5, len(GENE_NAMES_ORDERED)).tolist()
+            row = (
+                [f"example_{i:03d}", "chrSyn3A", rng.integers(0, 543379), "A", "G",
+                 "translation", rng.integers(-500, 500), "SNP"]
+                + [round(v, 4) for v in gene_vals]
+                + [105.0 + rng.normal(0, 5), 0.396 + rng.normal(0, 0.02),
+                   0.98 + rng.normal(0, 0.01), 1.0 + rng.normal(0, 0.05),
+                   0.82 + rng.normal(0, 0.03)]
+            )
+            rows.append(row)
+        example_df = pd.DataFrame(rows, columns=header)
+        example_df.to_csv(path, index=False)
+        log.info("Example sweep CSV written → %s", path)
+
+
 
 class Syn3ASurrogateModel:
     """
     Multi-output MLP surrogate that emulates the Syn3A whole-cell simulator.
 
     Design choices:
-    - 3-layer MLP with skip-connection-inspired architecture (via sklearn MLP).
-    - Multi-output wrapped in MultiOutputRegressor (one MLP per phenotype)
-      to allow different hyperparameters per target if needed.
+    - 3-layer MLP (256 → 128 → 64, ReLU, Adam) predicting all 5 phenotypes jointly,
+      wrapped in MultiOutputRegressor which clones and fits one MLP per output target.
     - StandardScaler for input normalisation (critical for MLP training).
-    - Lightweight ensemble of 5 models for uncertainty quantification.
+    - Lightweight ensemble of 5 independently-seeded models for uncertainty quantification.
     - Training runtime <60s on a laptop CPU for N=5 000 samples.
     """
 
@@ -394,7 +559,10 @@ class Syn3ASurrogateModel:
             X_tr = scaler_X.fit_transform(X_train)
             Y_tr = scaler_Y.fit_transform(Y_train)
 
-            # Per-phenotype MLP — moderate depth, batch normalisation via Adam
+            # Disable early stopping for very small datasets (< 50 samples after split)
+            # to avoid sklearn's validation-set-too-small error.
+            use_early_stopping = len(X_tr) >= 50
+
             base_mlp = MLPRegressor(
                 hidden_layer_sizes=(256, 128, 64),
                 activation="relu",
@@ -402,7 +570,7 @@ class Syn3ASurrogateModel:
                 learning_rate_init=3e-4,
                 max_iter=500,
                 random_state=seed,
-                early_stopping=True,
+                early_stopping=use_early_stopping,
                 validation_fraction=0.1,
                 n_iter_no_change=20,
                 tol=1e-5,
@@ -588,18 +756,44 @@ class VariantToPhenotypeOracle:
         n_train: int = 5000,
         rng_seed: int = 42,
         model_path: str | Path | None = None,
+        data_path: str | Path | None = None,
     ) -> "VariantToPhenotypeOracle":
         """
-        Generate synthetic training data (or load from model_path) and
-        return a trained oracle.
+        Train the surrogate and return a ready oracle.
+
+        Parameters
+        ----------
+        n_train : int
+            Number of synthetic training samples. Used only when data_path
+            is None (i.e. simulation mode).
+        rng_seed : int
+            Random seed for synthetic data generation and model training.
+        model_path : str or Path, optional
+            If this path exists, the trained model is loaded from it instead
+            of training. After training, the model is saved here.
+        data_path : str or Path, optional
+            Path to a real Syn3A simulation sweep CSV produced by the
+            Luthey-Schulten lab CME/ODE model. When supplied, the surrogate
+            is trained on real simulation outputs rather than synthetic data.
+            See SweepDataLoader for the expected CSV schema and
+            SweepDataLoader.write_example_csv() to generate a format template.
+
+        Returns
+        -------
+        VariantToPhenotypeOracle
         """
         if model_path and Path(model_path).exists():
             surr = Syn3ASurrogateModel.load(model_path)
             return cls(surr)
 
-        log.info("Generating synthetic Syn3A simulation training data  (n=%d) …", n_train)
-        emulator = Syn3ASimulationEmulator(rng_seed=rng_seed)
-        X, Y = emulator.generate(n_train)
+        if data_path is not None:
+            log.info("Loading real Syn3A simulation sweep data from %s …", data_path)
+            loader = SweepDataLoader(data_path)
+            X, Y = loader.load()
+        else:
+            log.info("Generating synthetic Syn3A simulation training data  (n=%d) …", n_train)
+            emulator = Syn3ASimulationEmulator(rng_seed=rng_seed)
+            X, Y = emulator.generate(n_train)
 
         surr = Syn3ASurrogateModel()
         surr.train(X, Y)
@@ -671,20 +865,31 @@ if __name__ == "__main__":
         description="Train and run the Syn3A whole-cell surrogate model"
     )
     parser.add_argument("--n-train", type=int, default=5000,
-                        help="Number of synthetic training samples")
+                        help="Number of synthetic training samples (ignored if --data-path is set)")
+    parser.add_argument("--data-path", default=None,
+                        help="Path to real Syn3A simulation sweep CSV for training")
+    parser.add_argument("--write-example-csv", default=None, metavar="PATH",
+                        help="Write an example sweep CSV to PATH and exit")
     parser.add_argument("--model-path", default="outputs/syn3a_surrogate.pkl",
                         help="Path to save/load the trained model")
     parser.add_argument("--out-dir", default="outputs",
                         help="Output directory for predictions")
-    parser.add_argument("--demo-variants", type=int, default=10,
-                        help="Number of random demo variants to predict")
+    parser.add_argument("--demo-variants", type=int, default=5,
+                        help="Number of hand-crafted demo variants to predict (1-5)")
     args = parser.parse_args()
+
+    if args.write_example_csv:
+        from pathlib import Path as _Path
+        SweepDataLoader.write_example_csv(args.write_example_csv)
+        print(f"Example sweep CSV written to: {args.write_example_csv}")
+        raise SystemExit(0)
 
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
 
     # Build and train
     oracle = VariantToPhenotypeOracle.build_and_train(
         n_train=args.n_train,
+        data_path=args.data_path,
         model_path=args.model_path,
     )
 
@@ -727,7 +932,7 @@ if __name__ == "__main__":
     print("=" * 65)
 
     results = []
-    for case in demo_cases:
+    for case in demo_cases[:max(1, min(args.demo_variants, len(demo_cases)))]:
         pred = oracle.predict_variant(
             variant_id=case["id"],
             delta_log2_expr=case["delta"],
