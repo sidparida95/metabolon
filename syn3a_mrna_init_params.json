@@ -1,0 +1,39 @@
+{
+  "_metadata": {
+    "model": "AlphaGenome",
+    "ontology_term": "UBERON:0001157",
+    "model_fold": "all_folds",
+    "n_genes": 25,
+    "simulate": true,
+    "syn3a_chromosome": "CP016816.2",
+    "cell_volume_fl": 0.047,
+    "reference_total_mrna": 149.0
+  },
+  "mRNA_init_counts": {
+    "dnaA": 4.877,
+    "dnaN": 0.9534,
+    "gyrB": 20.606,
+    "rpoA": 1.9297,
+    "rpoB": 0.6336,
+    "rpoC": 1.1866,
+    "rpsL": 0.9611,
+    "rpsG": 3.5465,
+    "fusA": 5.2848,
+    "tuf": 2.7962,
+    "atpA": 0.4151,
+    "atpB": 9.6582,
+    "atpE": 1.5532,
+    "gapA": 1.085,
+    "pgk": 19.5306,
+    "pyk": 1.6732,
+    "rpsA": 4.3739,
+    "infB": 7.8908,
+    "ftsZ": 8.5924,
+    "ftsA": 6.1466,
+    "ftsQ": 6.1672,
+    "lepA": 1.5742,
+    "secA": 0.3124,
+    "clpB": 0.3577,
+    "dnaK": 50.497
+  }
+}
